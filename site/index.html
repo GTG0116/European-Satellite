@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>GOES-19 Satellite Viewer</title>
+    <title>Meteosat (MSG/SEVIRI) Satellite Viewer</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -109,8 +109,8 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
-        // Initialize Map — centered on continental US
-        var map = L.map('map').setView([37, -95], 4);
+        // Initialize Map — centered on Europe
+        var map = L.map('map').setView([52, 10], 4);
 
         // Dark base layer
         L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -119,9 +119,9 @@
             maxZoom: 19
         }).addTo(map);
 
-        // Image bounds — MUST match EXTENT in process_data.py: [-135, -60, 20, 55]
+        // Image bounds — MUST match EXTENT in process_data.py: [-25, 45, 30, 72]
         // Leaflet format: [[south, west], [north, east]]
-        var imageBounds = [[20, -135], [55, -60]];
+        var imageBounds = [[30, -25], [72, 45]];
         var imageUrl = 'data/';
 
         // Satellite overlay layers — always show the latest frame (_00)
@@ -131,10 +131,10 @@
         var waterVaporLayer = L.imageOverlay(imageUrl + 'water_vapor_00.png', imageBounds, {opacity: 0.85});
 
         var overlayMaps = {
-            "GeoColor (RGB)":       geocolorLayer,
-            "Visible (Band 2)":     visibleLayer,
-            "Infrared (Band 13)":   infraredLayer,
-            "Water Vapor (Band 9)": waterVaporLayer
+            "GeoColor (RGB)":            geocolorLayer,
+            "Visible (VIS 0.6 µm)":      visibleLayer,
+            "Infrared (IR 10.8 µm)":     infraredLayer,
+            "Water Vapor (WV 6.2 µm)":   waterVaporLayer
         };
 
         L.control.layers({}, overlayMaps, {collapsed: false}).addTo(map);
@@ -149,8 +149,8 @@
         var LEGENDS = {
             // Matches _ir_colormap() in process_data.py (190 – 310 K)
             infrared: {
-                title: 'Infrared — Band 13',
-                subtitle: 'Clean IR Longwave (10.35 µm)',
+                title: 'Infrared — IR 10.8 µm',
+                subtitle: 'SEVIRI Clean IR Window',
                 gradient: 'linear-gradient(to right,' +
                     '#ffffff 0%,'   +   // 190 K
                     '#dd00dd 7%,'   +   // ~199 K
@@ -170,8 +170,8 @@
 
             // Matches _wv_colormap() in process_data.py (195 – 280 K)
             watervapor: {
-                title: 'Water Vapor — Band 9',
-                subtitle: 'Mid-Level Water Vapor (6.95 µm)',
+                title: 'Water Vapor — WV 6.2 µm',
+                subtitle: 'SEVIRI Upper-Level Water Vapour',
                 gradient: 'linear-gradient(to right,' +
                     '#00003c 0%,'   +   // 195 K
                     '#0000cc 18%,'  +   // ~210 K
@@ -189,8 +189,8 @@
 
             // Grayscale visible
             visible: {
-                title: 'Visible — Band 2',
-                subtitle: 'Red Visible (0.64 µm)',
+                title: 'Visible — VIS 0.6 µm',
+                subtitle: 'SEVIRI Visible Channel',
                 gradient: 'linear-gradient(to right, #000000, #ffffff)',
                 ticks: ['0 %', '25 %', '50 %', '75 %', '100 %'],
                 unit: 'Reflectance'

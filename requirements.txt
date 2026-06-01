@@ -1,7 +1,5 @@
-boto3
-xarray
-netcdf4
+eumdac
+satpy
+pyresample
 numpy
 matplotlib
-cartopy
-scipy

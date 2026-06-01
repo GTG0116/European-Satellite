@@ -1,27 +1,37 @@
-import boto3
-import xarray as xr
+import os
+import shutil
+import zipfile
+import glob
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
-import cartopy.crs as ccrs
 import numpy as np
-import os
 from datetime import datetime, timezone, timedelta
-from botocore import UNSIGNED
-from botocore.config import Config
-from scipy.ndimage import zoom
+
+import eumdac
+from satpy import Scene
+from pyresample import create_area_def
 
 OUTPUT_DIR = 'site/data'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-BUCKET = 'noaa-goes19'
+# EUMETSAT Data Store collection for Meteosat Second Generation (MSG) SEVIRI
+# Level 1.5 rectified image data from the 0° service (full disk, every 15 min).
+COLLECTION_ID = 'EO:EUM:DAT:MSG:HRSEVIRI'
+
 MAX_FRAMES = 10  # rolling frame buffer per product
 
 # Geographic extent: [west_lon, east_lon, south_lat, north_lat]
-# This MUST match the imageBounds in site/index.html
-# GOES-19 CONUS sector extends to ~135.7°W; use -135 to capture the full west coast.
-EXTENT = [-135, -60, 20, 55]
+# This MUST match the imageBounds in site/index.html.
+# MSG/SEVIRI sits over 0° longitude, so the natural coverage is Europe,
+# Africa and the Atlantic. We crop to a Europe + Mediterranean window.
+EXTENT = [-25, 45, 30, 72]
+
+# Output grid resolution in degrees. SEVIRI is ~3 km at nadir / ~5 km over
+# Europe; a coarser grid keeps the rendered PNGs small and fast to produce.
+# Larger values => bigger pixels, smaller files, faster runs.
+RESOLUTION_DEG = 0.04
 
 
 # ---------------------------------------------------------------------------
@@ -114,363 +124,238 @@ def shift_frames(product_base):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# EUMETSAT Data Store access
 # ---------------------------------------------------------------------------
 
-def get_latest_goes_file(s3_client, band, domain='C'):
-    """Find the most recent GOES-19 ABI CMIP file for a given band.
+def download_latest_seviri():
+    """Download the most recent MSG/SEVIRI native (.nat) file.
 
-    Searches backwards up to 6 hours to find the latest available file.
-    Domain 'C' = CONUS, 'F' = Full Disk, 'M' = Mesoscale.
+    Authenticates against the EUMETSAT Data Store with credentials supplied
+    via the EUMETSAT_CONSUMER_KEY / EUMETSAT_CONSUMER_SECRET environment
+    variables, searches the HRSEVIRI collection for the latest product, and
+    extracts the .nat image file into /tmp.
+
+    Returns the local path to the .nat file, or None on failure.
     """
-    now = datetime.now(timezone.utc)
+    consumer_key    = os.environ.get('EUMETSAT_CONSUMER_KEY')
+    consumer_secret = os.environ.get('EUMETSAT_CONSUMER_SECRET')
+    if not consumer_key or not consumer_secret:
+        print("  ERROR: EUMETSAT_CONSUMER_KEY / EUMETSAT_CONSUMER_SECRET not set.")
+        return None
 
-    for hour_offset in range(6):
-        t = now - timedelta(hours=hour_offset)
-        year = t.strftime('%Y')
-        doy  = t.strftime('%j')
-        hour = t.strftime('%H')
-
-        prefix   = f'ABI-L2-CMIP{domain}/{year}/{doy}/{hour}/'
-        band_str = f'C{band:02d}_G19'
-
-        try:
-            resp  = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
-            files = [
-                obj['Key'] for obj in resp.get('Contents', [])
-                if band_str in obj['Key']
-            ]
-            if files:
-                latest = sorted(files)[-1]
-                print(f"  Found: {os.path.basename(latest)}")
-                return latest
-        except Exception as e:
-            print(f"  Warning: could not list {prefix}: {e}")
-
-    return None
-
-
-def _make_figure():
-    """Create a matplotlib figure sized to match the geographic extent."""
-    lon_range = EXTENT[1] - EXTENT[0]
-    lat_range = EXTENT[3] - EXTENT[2]
-    mid_lat   = (EXTENT[2] + EXTENT[3]) / 2.0
-    fig_width = 12.0
-    fig_height = fig_width * lat_range / (lon_range * np.cos(np.radians(mid_lat)))
-
-    fig = plt.figure(figsize=(fig_width, fig_height))
-    ax  = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
-    ax.set_extent(EXTENT, crs=ccrs.PlateCarree())
-    ax.set_aspect('auto')  # prevent Cartopy equal-aspect padding; image must fill extent exactly
-    ax.set_axis_off()
-    fig.patch.set_alpha(0.0)
-    ax.patch.set_alpha(0.0)
-    return fig, ax
-
-
-def _download_band(s3_client, band_num):
-    """Download a GOES-19 ABI band.
-
-    Returns (data_array, x_metres, y_metres, goes_proj).
-    data_array contains raw float values with NaNs intact (no fill applied).
-    Returns (None, None, None, None) on any failure.
-    """
-    print(f"  Downloading Band {band_num}...")
-    key = get_latest_goes_file(s3_client, band_num)
-    if key is None:
-        print(f"  ERROR: No Band {band_num} data found in the last 6 hours.")
-        return None, None, None, None
-
-    local_file = f'/tmp/goes_band{band_num}.nc'
     try:
-        s3_client.download_file(BUCKET, key, local_file)
-        ds = xr.open_dataset(local_file, engine='netcdf4')
+        token     = eumdac.AccessToken((consumer_key, consumer_secret))
+        datastore = eumdac.DataStore(token)
+        collection = datastore.get_collection(COLLECTION_ID)
 
-        cmi = ds['CMI'].values.astype(np.float32)
-
-        proj_var  = ds['goes_imager_projection']
-        sat_h     = float(proj_var.attrs['perspective_point_height'])
-        sat_lon   = float(proj_var.attrs['longitude_of_projection_origin'])
-        sat_sweep = str(proj_var.attrs['sweep_angle_axis'])
-        x = ds['x'].values * sat_h
-        y = ds['y'].values * sat_h
-        goes_proj = ccrs.Geostationary(
-            central_longitude=sat_lon,
-            satellite_height=sat_h,
-            sweep_axis=sat_sweep,
+        # SEVIRI full-disk scans arrive every 15 min; look back a few hours so
+        # the job still succeeds if the very latest slot is briefly unavailable.
+        now   = datetime.now(timezone.utc)
+        products = collection.search(
+            dtstart=now - timedelta(hours=3),
+            dtend=now,
         )
-        ds.close()
-        return cmi, x, y, goes_proj
+
+        product = None
+        for p in products:           # search returns newest first
+            product = p
+            break
+
+        if product is None:
+            print("  ERROR: No SEVIRI products found in the last 3 hours.")
+            return None
+
+        print(f"  Latest product: {product}")
+
+        # Download the product (a ZIP archive) and extract the .nat image file.
+        zip_path = os.path.join('/tmp', f'{product}.zip')
+        with product.open() as fsrc, open(zip_path, 'wb') as fdst:
+            print(f"  Downloading {fsrc.name}...")
+            shutil.copyfileobj(fsrc, fdst)
+
+        extract_dir = '/tmp/seviri'
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(extract_dir)
+        os.remove(zip_path)
+
+        nat_files = glob.glob(os.path.join(extract_dir, '**', '*.nat'), recursive=True)
+        if not nat_files:
+            print("  ERROR: No .nat file inside the downloaded product.")
+            return None
+
+        print(f"  Extracted: {os.path.basename(nat_files[0])}")
+        return nat_files[0]
 
     except Exception as e:
-        print(f"  ERROR loading Band {band_num}: {e}")
+        print(f"  ERROR downloading SEVIRI data: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, None, None
-
-    finally:
-        if os.path.exists(local_file):
-            os.remove(local_file)
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Single-band renderer
-# ---------------------------------------------------------------------------
+def load_channels(nat_file):
+    """Read a SEVIRI .nat file and resample the needed channels to the Europe grid.
 
-def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, gamma=1.0):
-    """Download and render a single GOES-19 ABI band as a transparent PNG.
-
-    gamma – optional power-law correction applied after normalising to [0, 1].
-            gamma < 1 brightens the image (e.g. 0.5 = square-root stretch).
+    Returns a dict of 2-D numpy arrays on a regular lat/lon grid plus the scene
+    start time:
+        {
+            'VIS006': reflectance [0-1],
+            'VIS008': reflectance [0-1],
+            'WV_062': brightness temperature [K],
+            'IR_108': brightness temperature [K],
+            'start_time': datetime,
+        }
+    Off-disk / out-of-coverage pixels are NaN. Returns None on failure.
     """
-    print(f"\n--- Band {band}: {output_filename} ---")
+    reflective = ['VIS006', 'VIS008']
+    thermal    = ['WV_062', 'IR_108']
 
-    key = get_latest_goes_file(s3_client, band)
-    if key is None:
-        print(f"  ERROR: No Band {band} data found in the last 6 hours. Skipping.")
-        return
-
-    local_file = f'/tmp/goes_band{band}.nc'
     try:
-        print(f"  Downloading...")
-        s3_client.download_file(BUCKET, key, local_file)
+        scn = Scene(reader='seviri_l1b_native', filenames=[nat_file])
+        scn.load(reflective, calibration='reflectance')
+        scn.load(thermal, calibration='brightness_temperature')
 
-        ds       = xr.open_dataset(local_file, engine='netcdf4')
-        cmi_data = ds['CMI'].values  # Reflectance [0-1] for visible; BT [K] for IR/WV
-
-        # Apply gamma correction if requested (normalise → gamma → restore range)
-        if gamma != 1.0:
-            normed   = np.clip((cmi_data - vmin) / (vmax - vmin), 0.0, 1.0)
-            cmi_data = np.power(normed, gamma) * (vmax - vmin) + vmin
-
-        # --- Projection parameters from the file ---
-        proj_var  = ds['goes_imager_projection']
-        sat_h     = float(proj_var.attrs['perspective_point_height'])
-        sat_lon   = float(proj_var.attrs['longitude_of_projection_origin'])
-        sat_sweep = str(proj_var.attrs['sweep_angle_axis'])
-
-        # Convert scan angles (radians) → projection coordinates (meters)
-        x = ds['x'].values * sat_h
-        y = ds['y'].values * sat_h
-        X, Y = np.meshgrid(x, y)
-
-        goes_proj = ccrs.Geostationary(
-            central_longitude=sat_lon,
-            satellite_height=sat_h,
-            sweep_axis=sat_sweep
+        area = create_area_def(
+            'europe',
+            {'proj': 'longlat', 'datum': 'WGS84'},
+            area_extent=(EXTENT[0], EXTENT[2], EXTENT[1], EXTENT[3]),  # W,S,E,N
+            resolution=RESOLUTION_DEG,
+            units='degrees',
         )
+        local = scn.resample(area, resampler='nearest', radius_of_influence=50000)
 
-        fig, ax = _make_figure()
-
-        ax.pcolormesh(
-            X, Y, cmi_data,
-            transform=goes_proj,
-            cmap=colormap,
-            vmin=vmin,
-            vmax=vmax,
-            shading='auto'
-        )
-
-        product_base = output_filename.replace('.png', '')
-        shift_frames(product_base)
-        output_path = os.path.join(OUTPUT_DIR, f'{product_base}_00.png')
-        plt.savefig(output_path, dpi=300, transparent=True)
-        plt.close()
-        print(f"  Saved: {output_path}")
-
-        ds.close()
+        out = {'start_time': scn.start_time}
+        # Reflectances come back in percent (0-100); rescale to 0-1.
+        for name in reflective:
+            out[name] = np.asarray(local[name].values, dtype=np.float32) / 100.0
+        for name in thermal:
+            out[name] = np.asarray(local[name].values, dtype=np.float32)
+        return out
 
     except Exception as e:
-        print(f"  ERROR: {e}")
+        print(f"  ERROR loading channels: {e}")
         import traceback
         traceback.print_exc()
+        return None
 
-    finally:
-        if os.path.exists(local_file):
-            os.remove(local_file)
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
+
+def _save_rgba(rgba, product_base):
+    """Write an (H, W, 4) float RGBA array [0-1] as the newest frame PNG.
+
+    The array is north-up (row 0 = north), matching the Leaflet imageBounds,
+    so it is written directly with no flip.
+    """
+    shift_frames(product_base)
+    output_path = os.path.join(OUTPUT_DIR, f'{product_base}_00.png')
+    plt.imsave(output_path, np.clip(rgba, 0.0, 1.0))
+    print(f"  Saved: {output_path}")
+
+
+def render_single_band(data, product_base, colormap, vmin, vmax, gamma=1.0):
+    """Render a single channel through a colormap as a transparent PNG.
+
+    NaN pixels (off-disk / no coverage) become fully transparent.
+    gamma < 1 brightens the image (e.g. 0.5 = square-root stretch).
+    """
+    valid  = np.isfinite(data)
+    normed = np.clip((data - vmin) / (vmax - vmin), 0.0, 1.0)
+    normed = np.where(valid, normed, 0.0)
+    if gamma != 1.0:
+        normed = np.power(normed, gamma)
+
+    rgba = colormap(normed)              # (H, W, 4) float in [0, 1]
+    rgba[..., 3] = valid.astype(np.float32)
+    _save_rgba(rgba, product_base)
 
 
 # ---------------------------------------------------------------------------
 # GeoColor composite (day / night)
 # ---------------------------------------------------------------------------
 
-def process_geocolor(s3_client):
-    """GeoColor RGB composite.
+def process_geocolor(channels):
+    """GeoColor-style RGB composite, switching between day and night.
 
-    Daytime  – pseudo-natural colour from Bands 1 and 2 with gamma correction.
-    Nighttime – IR cloud layer (Band 13) blended with city-lights proxy
-                (Band 7 minus thermal background) on a transparent background.
+    Daytime  – pseudo-natural colour from the SEVIRI visible channels
+               (VIS006 / VIS008) with an IR cloud-top enhancement.
+    Nighttime – IR cloud layer (IR_108) on a transparent background.
     """
-    print(f"\n--- GeoColor RGB Composite ---")
+    print("\n--- GeoColor RGB Composite ---")
+    vis06 = channels['VIS006']
+    vis08 = channels['VIS008']
+    ir108 = channels['IR_108']
 
-    # Fetch the two visible bands needed for the RGB composite
-    b1, x1, y1, goes_proj = _download_band(s3_client, 1)
-    if b1 is None:
-        print("  ERROR: Missing Band 1. Skipping GeoColor.")
-        return
-
-    b2, x2, y2, _ = _download_band(s3_client, 2)
-    if b2 is None:
-        print("  ERROR: Missing Band 2. Skipping GeoColor.")
-        return
-
-    # Band 2 is 0.5 km (2× resolution) – downsample to match Band 1 (1 km)
-    b2 = np.nan_to_num(b2, nan=0.0)
-    if b2.shape != b1.shape:
-        zy = b1.shape[0] / b2.shape[0]
-        zx = b1.shape[1] / b2.shape[1]
-        b2 = zoom(b2, (zy, zx), order=1)
-
-    b1 = np.nan_to_num(b1, nan=0.0)
-
-    # Determine day vs night: at night Band 2 visible reflectance ≈ 0
-    mean_ref = float(np.nanmean(b2))
-    is_daytime = mean_ref > 0.05
-    print(f"  Band 2 mean reflectance: {mean_ref:.4f}  →  {'DAYTIME' if is_daytime else 'NIGHTTIME'}")
+    # Day vs night: at night the visible reflectance collapses towards zero.
+    mean_ref = float(np.nanmean(vis06))
+    is_daytime = mean_ref > 0.03
+    print(f"  VIS006 mean reflectance: {mean_ref:.4f}  →  "
+          f"{'DAYTIME' if is_daytime else 'NIGHTTIME'}")
 
     if is_daytime:
-        # Fetch Band 13 for cloud-top enhancement (failure is non-fatal)
-        bt13, *_ = _download_band(s3_client, 13)
-        _render_geocolor_day(b1, b2, x1, y1, goes_proj, bt13)
+        _render_geocolor_day(vis06, vis08, ir108)
     else:
-        _render_geocolor_night(s3_client)
+        _render_geocolor_night(ir108)
 
 
-def _render_geocolor_day(b1, b2, x, y, goes_proj, bt13=None):
+def _render_geocolor_day(vis06, vis08, ir108):
     """Pseudo-natural colour composite for daytime.
 
-    bt13 is an optional Band 13 brightness-temperature array (same spatial
-    footprint after resampling).  When provided, very cold cloud tops are
-    blended towards bright white so deep convective anvils are clearly
-    visible against land/ocean backgrounds.
+    SEVIRI has no true blue channel, so natural colour is approximated from the
+    0.6 µm (VIS006) and 0.8 µm (VIS008) reflectances. A vegetation index derived
+    from the two channels greens up land; cold IR_108 cloud tops are blended
+    towards white so storms and anvils stand out.
     """
-    R = np.clip(b2, 0, 1)
-    # Synthetic green: average of red and blue channels only.
-    # Omitting NIR (Band 3 / 0.86 µm) prevents the yellow cast that NIR
-    # introduces over vegetated and arid land surfaces.
-    G = np.clip(0.5 * b2 + 0.5 * b1, 0, 1)
-    B = np.clip(b1, 0, 1)
+    valid = np.isfinite(vis06)
+    v6 = np.nan_to_num(vis06, nan=0.0)
+    v8 = np.nan_to_num(vis08, nan=0.0)
 
-    # Gamma correction for natural brightness
+    # NDVI-like greenness: vegetation reflects strongly at 0.8 µm vs 0.6 µm.
+    veg = np.clip((v8 - v6) / (v8 + v6 + 1e-6), 0.0, 0.6)
+    R = np.clip(v6 * (1.0 - 0.35 * veg), 0.0, 1.0)
+    G = np.clip(v6 * (1.0 + 0.45 * veg), 0.0, 1.0)
+    B = np.clip(v6 * 0.85, 0.0, 1.0)
+
+    # Gamma correction for natural brightness (square-root stretch).
     gamma = 0.5
-    R = np.power(R, gamma)
-    G = np.power(G, gamma)
-    B = np.power(B, gamma)
+    R, G, B = R ** gamma, G ** gamma, B ** gamma
 
-    # --- Cloud enhancement via Band 13 IR ---
-    # Pixels colder than ~255 K (high cloud tops) are blended towards bright
-    # white, making anvils and deep convection clearly pop out.
-    if bt13 is not None:
-        bt13_f = np.where(np.isnan(bt13), 320.0, bt13)
-        # Band 13 is 2 km; Band 1/2/3 composite is at 1 km – upsample to match
-        if bt13_f.shape != R.shape:
-            zy = R.shape[0] / bt13_f.shape[0]
-            zx = R.shape[1] / bt13_f.shape[1]
-            bt13_f = zoom(bt13_f, (zy, zx), order=1)
-        # 255 K → 0 (no enhancement); 200 K → 1 (pure-white cloud tops)
-        cloud_enhance = np.clip((255.0 - bt13_f) / 55.0, 0.0, 1.0)
-        strength = 0.85
-        R = np.clip(R + cloud_enhance * (1.0 - R) * strength, 0.0, 1.0)
-        G = np.clip(G + cloud_enhance * (1.0 - G) * strength, 0.0, 1.0)
-        B = np.clip(B + cloud_enhance * (1.0 - B) * (strength + 0.05), 0.0, 1.0)
+    # Cloud enhancement: pixels colder than ~265 K blend towards bright white.
+    bt = np.where(np.isfinite(ir108), ir108, 320.0)
+    cloud = np.clip((265.0 - bt) / 60.0, 0.0, 1.0)
+    s = 0.85
+    R = np.clip(R + cloud * (1.0 - R) * s, 0.0, 1.0)
+    G = np.clip(G + cloud * (1.0 - G) * s, 0.0, 1.0)
+    B = np.clip(B + cloud * (1.0 - B) * (s + 0.05), 0.0, 1.0)
 
-    rgb = np.dstack([R, G, B])
-    fig, ax = _make_figure()
-    img_extent = (x[0], x[-1], y[-1], y[0])
-    ax.imshow(rgb, origin='upper', extent=img_extent,
-              transform=goes_proj, aspect='auto', interpolation='none')
-
-    shift_frames('geocolor')
-    output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
-    plt.savefig(output_path, dpi=300, transparent=True)
-    plt.close()
-    print(f"  Saved (daytime): {output_path}")
+    A = valid.astype(np.float32)
+    _save_rgba(np.dstack([R, G, B, A]), 'geocolor')
+    print("  (daytime composite)")
 
 
-def _render_geocolor_night(s3_client):
+def _render_geocolor_night(ir108):
     """Nighttime GeoColor composite.
 
-    Cloud layer  – derived from Band 13 (10.35 µm clean IR window).
-                   Cold temperatures → bright blue-white clouds.
-    City lights  – derived from Band 7 (3.9 µm shortwave IR) minus the
-                   thermal background estimated from Band 13.  At night,
-                   cities, fires, and industrial heat sources emit
-                   anomalously in 3.9 µm.
-    Background   – fully transparent so the dark basemap shows through.
+    Cloud layer derived from IR_108 (10.8 µm clean window): colder tops render
+    as brighter blue-white cloud. Clear sky stays transparent so the dark
+    basemap shows through. (SEVIRI has no day/night band, so there is no
+    city-lights layer.)
     """
-    # Band 13: brightness temperature (K), same 2 km resolution as Band 7
-    bt13, x13, y13, goes_proj = _download_band(s3_client, 13)
-    if bt13 is None:
-        print("  ERROR: Missing Band 13 for nighttime GeoColor. Skipping.")
-        return
+    bt = np.where(np.isfinite(ir108), ir108, 320.0)
 
-    # Fill off-earth NaNs with a warm value so they don't look like cloud tops
-    bt13 = np.where(np.isnan(bt13), 320.0, bt13)
+    # 275 K → no cloud (transparent); 220 K → deep convection (opaque).
+    cloud_opacity = np.clip((275.0 - bt) / 55.0, 0.0, 1.0)
 
-    # Band 7: 3.9 µm shortwave IR — optional; gracefully absent
-    bt7, x7, y7, _ = _download_band(s3_client, 7)
+    R = cloud_opacity * 0.80
+    G = cloud_opacity * 0.88
+    B = cloud_opacity * 1.00
+    A = cloud_opacity
 
-    h, w = bt13.shape
-
-    # ------------------------------------------------------------------
-    # Cloud layer
-    # ------------------------------------------------------------------
-    # 275 K → no cloud (opacity 0); 220 K → deep convection (opacity 1)
-    cloud_opacity = np.clip((275.0 - bt13) / 55.0, 0.0, 1.0)
-
-    # Clouds rendered as cool blue-white (scattered light / natural night look)
-    cloud_R = cloud_opacity * 0.80
-    cloud_G = cloud_opacity * 0.88
-    cloud_B = cloud_opacity * 1.00
-
-    # ------------------------------------------------------------------
-    # City lights layer
-    # ------------------------------------------------------------------
-    if bt7 is not None:
-        bt7 = np.where(np.isnan(bt7), 0.0, bt7)
-
-        # Match Band 7 resolution to Band 13 if needed
-        if bt7.shape != (h, w):
-            zy = h / bt7.shape[0]
-            zx = w / bt7.shape[1]
-            bt7 = zoom(bt7, (zy, zx), order=1)
-
-        # At typical surface temperatures Band 7 BT runs ~12 K cooler than
-        # Band 13 due to Planck function differences.  Where Band 7 exceeds
-        # this offset (i.e. Band7 > Band13 − 12) there is anomalous emission
-        # from city lights, fires, or industrial heat.
-        city_raw = np.clip((bt7 - (bt13 - 12.0)) / 25.0, 0.0, 1.0)
-
-        # Only paint city lights over clear, warm surface pixels
-        surface_clear = (bt13 > 265.0).astype(np.float32)
-        city_lights   = city_raw * surface_clear
-    else:
-        city_lights = np.zeros((h, w), dtype=np.float32)
-        print("  WARNING: Band 7 unavailable; city lights layer disabled.")
-
-    # ------------------------------------------------------------------
-    # Compose RGBA image
-    # ------------------------------------------------------------------
-    # Clouds: blue-white  |  City lights: warm yellow-orange
-    R = np.clip(cloud_R + city_lights * 1.00, 0.0, 1.0)
-    G = np.clip(cloud_G + city_lights * 0.75, 0.0, 1.0)
-    B = np.clip(cloud_B + city_lights * 0.10, 0.0, 1.0)
-
-    # Alpha: transparent where there is nothing to show
-    A = np.clip(cloud_opacity + city_lights * 2.0, 0.0, 1.0)
-
-    rgba = np.dstack([R, G, B, A]).astype(np.float32)
-
-    fig, ax = _make_figure()
-    img_extent = (x13[0], x13[-1], y13[-1], y13[0])
-    ax.imshow(rgba, origin='upper', extent=img_extent,
-              transform=goes_proj, aspect='auto', interpolation='none')
-
-    shift_frames('geocolor')
-    output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
-    plt.savefig(output_path, dpi=300, transparent=True)
-    plt.close()
-    print(f"  Saved (nighttime): {output_path}")
+    _save_rgba(np.dstack([R, G, B, A]).astype(np.float32), 'geocolor')
+    print("  (nighttime composite)")
 
 
 # ---------------------------------------------------------------------------
@@ -478,38 +363,62 @@ def _render_geocolor_night(s3_client):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("GOES-19 Satellite Image Processor")
-    print("=" * 40)
-    print(f"Extent: {EXTENT}")
-    print(f"Bucket: s3://{BUCKET}")
+    print("MSG / SEVIRI (EUMETSAT) Satellite Image Processor")
+    print("=" * 48)
+    print(f"Extent:     {EXTENT}")
+    print(f"Resolution: {RESOLUTION_DEG}° / pixel")
+    print(f"Collection: {COLLECTION_ID}")
 
-    # Anonymous access — GOES-19 bucket is publicly readable
-    s3 = boto3.client(
-        's3',
-        region_name='us-east-1',
-        config=Config(signature_version=UNSIGNED)
-    )
+    nat_file = download_latest_seviri()
+    if nat_file is None:
+        print("\nERROR: Could not obtain SEVIRI data. Aborting.")
+        raise SystemExit(1)
 
-    # Band 2  — Visible (0.64 µm)              reflectance [0.0 – 1.0]
+    try:
+        channels = load_channels(nat_file)
+    finally:
+        # Clean up the (large) native file and its extraction directory.
+        shutil.rmtree('/tmp/seviri', ignore_errors=True)
+
+    if channels is None:
+        print("\nERROR: Could not process SEVIRI channels. Aborting.")
+        raise SystemExit(1)
+
+    # VIS006 — Visible (0.6 µm)            reflectance [0.0 – 1.0]
     # 'gray' maps 0→black (clear sky) and 1→white (bright cloud).
     # gamma=0.5 (square-root stretch) matches conventional satellite display.
-    process_goes_band(s3, 2,  'visible.png',  'gray',        vmin=0.0, vmax=1.0, gamma=0.5)
+    print("\n--- Visible (VIS006) ---")
+    render_single_band(channels['VIS006'], 'visible',
+                       plt.get_cmap('gray'), vmin=0.0, vmax=1.0, gamma=0.5)
 
-    # Band 13 — Clean IR Longwave (10.35 µm)   brightness temp [K]
-    # Custom NWS-style rainbow: cold tops → red/orange, warm surface → dark blue/black
-    process_goes_band(s3, 13, 'infrared.png', _ir_colormap(), vmin=190, vmax=310)
+    # IR_108 — Clean IR window (10.8 µm)   brightness temp [K]
+    # Custom NWS-style rainbow: cold tops → red/orange, warm surface → dark blue.
+    print("\n--- Infrared (IR_108) ---")
+    render_single_band(channels['IR_108'], 'infrared',
+                       _ir_colormap(), vmin=190, vmax=310)
 
-    # Band 9  — Mid-Level Water Vapor (6.95 µm) brightness temp [K]
-    # Custom enhancement: cold/moist → navy/blue, warm/dry → orange/red
-    process_goes_band(s3, 9,  'water_vapor.png', _wv_colormap(), vmin=195, vmax=280)
+    # WV_062 — Upper-Level Water Vapour (6.2 µm)  brightness temp [K]
+    # Custom enhancement: cold/moist → navy/blue, warm/dry → orange/red.
+    print("\n--- Water Vapor (WV_062) ---")
+    render_single_band(channels['WV_062'], 'water_vapor',
+                       _wv_colormap(), vmin=195, vmax=280)
 
-    # GeoColor — natural colour (day) or IR+city-lights composite (night)
-    process_geocolor(s3)
+    # GeoColor — natural colour (day) or IR cloud composite (night)
+    process_geocolor(channels)
 
-    # Write a plain-text timestamp so the website can show freshness
+    # Write a plain-text timestamp so the website can show freshness.
+    # Prefer the satellite acquisition time over wall-clock time.
+    sat_time = channels.get('start_time')
+    if isinstance(sat_time, datetime):
+        if sat_time.tzinfo is None:
+            sat_time = sat_time.replace(tzinfo=timezone.utc)
+        stamp = sat_time.astimezone(timezone.utc)
+    else:
+        stamp = datetime.now(timezone.utc)
+
     ts_path = os.path.join(OUTPUT_DIR, 'last_updated.txt')
     with open(ts_path, 'w') as f:
-        f.write(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))
+        f.write(stamp.strftime('%Y-%m-%d %H:%M UTC'))
     print(f"\nTimestamp written: {ts_path}")
     print("\nDone!")
 
