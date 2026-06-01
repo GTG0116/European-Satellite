@@ -1,0 +1,87 @@
+name: Update Satellite Data
+
+on:
+  repository_dispatch:
+    types: [satellite_update] # This is the event type cron-job.org will send
+  workflow_dispatch:      # Keeps the manual trigger from GitHub UI
+  # schedule:
+  #   - cron: '0 * * * *'  # Commented out so it relies purely on cron-job.org
+
+permissions:
+  contents: write
+
+jobs:
+  update-satellite:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed to find the last source-only commit
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libproj-dev proj-data proj-bin libgeos-dev
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate Satellite Images
+        run: python process_data.py
+
+      - name: Commit images to main (squash old data commits, keep one)
+        run: |
+          git config user.name  "GitHub Actions Bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add site/data/
+
+          # Skip if nothing changed
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          # Walk history to find the most recent commit whose tree does NOT contain
+          # site/data/ at all. That is the "clean" source baseline. Every data commit
+          # that accumulated on top of it will be squashed into one fresh commit.
+          CLEAN_BASE=""
+          for sha in $(git log --format="%H"); do
+            if ! git ls-tree --name-only -r "$sha" | grep -q "^site/data/"; then
+              CLEAN_BASE="$sha"
+              break
+            fi
+          done
+
+          if [ -n "$CLEAN_BASE" ]; then
+            # Soft-reset drops all prior data commits from the branch tip while
+            # preserving the staged index so nothing is lost.
+            git reset --soft "$CLEAN_BASE"
+          fi
+
+          git commit -m "chore: update satellite data [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+
+          # Force-push replaces the old data commit with the new one.
+          # raw.githubusercontent.com/.../main/site/data/... keeps working.
+          git push --force origin HEAD:main
+
+      - name: Deploy website to GitHub Pages (force-push, no history)
+        run: |
+          # Save generated site before switching branches
+          DEPLOY_DIR=$(mktemp -d)
+          cp -r site/. "$DEPLOY_DIR/"
+
+          # Orphan commit = no parent, so gh-pages never accumulates history
+          git checkout --orphan gh-pages-deploy
+          git rm -rf . --quiet
+          cp -r "$DEPLOY_DIR/." .
+          git add .
+          git commit -m "deploy: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push --force origin HEAD:gh-pages
