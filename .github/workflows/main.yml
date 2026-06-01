@@ -34,6 +34,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Generate Satellite Images
+        env:
+          EUMETSAT_CONSUMER_KEY:    ${{ secrets.EUMETSAT_CONSUMER_KEY }}
+          EUMETSAT_CONSUMER_SECRET: ${{ secrets.EUMETSAT_CONSUMER_SECRET }}
         run: python process_data.py
 
       - name: Commit images to main (squash old data commits, keep one)
